@@ -68,18 +68,7 @@ BASE_RESUME_PATH = get_base_resume_path()
 APPLICATIONS_DIR = get_applications_dir()
 
 ENV_CANDIDATE_PATHS = [
-    BASE_DIR / ".env",
-    BASE_DIR / ".env.local",
-    BASE_DIR / ".env.production",
-    Path("C:/Users/Kruz/Desktop/Projects/ai-finance-brief/.env.local"),
-    Path("C:/Users/Kruz/Desktop/Projects/ai-finance-brief/.env.production"),
-    Path("C:/Users/Kruz/Desktop/Projects/ai-finance-brief/.env.vercel.production"),
-    Path("C:/Users/Kruz/Desktop/Projects/ai-chess-coach/.env.local"),
-    Path("C:/Users/Kruz/Desktop/Projects/trade-journal/backend/.env"),
-    Path("C:/Users/Kruz/Desktop/Projects/local-website-generator/.env.local"),
-    Path("C:/Users/Kruz/Desktop/Projects/creative-agent/.env"),
-    Path("C:/Users/Kruz/Desktop/Projects/MoneyPrinter/bot/.env"),
-    Path("C:/Users/Kruz/Desktop/Projects/StockBot/bot/.env"),
-    Path("C:/Users/Kruz/Desktop/Projects/game-tools/poe-assistant/.env"),
-    Path("C:/Users/Kruz/Desktop/Projects/alert-monitor/.env"),
+    CODE_ROOT / ".env",
+    CODE_ROOT / ".env.local",
+    CODE_ROOT / ".env.production",
 ]

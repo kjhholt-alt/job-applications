@@ -42,6 +42,8 @@ from job_finder.config import (
     get_liked_dir,
     get_user_base_resume_path,
     get_user_templates_dir,
+    INBOX_DIR,
+    LIKED_DIR,
 )
 from job_finder.env import ensure_anthropic_key, ensure_resend_key, get_resend_from
 from job_finder.filtering import evaluate_filters, load_reputable_companies, save_reputable_companies
@@ -402,4 +404,4 @@ with tab_profile:
                 "<p>This is a test alert from Job Finder.</p>",
                 from_email=resend_from,
             )
-            st.success("Test email sent")
+            st.success("Test email sent")
