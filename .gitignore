@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+data/
+jobs/
+applications/
+html/
+*.db
+*.sqlite3
+*.pdf
+*.docx
+*.doc
+*.log
+templates/base-resume.md
