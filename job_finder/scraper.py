@@ -1,47 +1,39 @@
 """
-Job scraper using LinkedIn's public guest API.
-No authentication, no API key, no C extensions — just requests + bs4.
+Job scraper — LinkedIn (primary) + Indeed RSS (fallback).
+Uses a warmed-up requests.Session so LinkedIn doesn't block cold requests.
+No API key, no C extensions — just requests, bs4, feedparser.
 """
 from __future__ import annotations
 
-import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
 
 from .parser import slugify
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Browser headers ───────────────────────────────────────────────────────────
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+_BASE_HEADERS = {
+    "User-Agent": _UA,
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
-
-_LI_SEARCH = (
-    "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-    "?keywords={keywords}&location={location}&count={count}&start={start}"
-)
-_LI_DETAIL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
-
 
 # ── Search term extraction ────────────────────────────────────────────────────
 
 def extract_search_terms(fingerprints: List[Dict]) -> List[str]:
-    """
-    Derive search queries from liked-job fingerprints.
-    Prioritises role_title, then role_family + top domain combos.
-    Returns up to 4 distinct terms.
-    """
+    """Derive search queries from liked-job fingerprints (up to 4 terms)."""
     terms: list[str] = []
     seen: set[str] = set()
 
@@ -54,7 +46,6 @@ def extract_search_terms(fingerprints: List[Dict]) -> List[str]:
             terms.append(role_title)
             seen.add(role_title.lower())
 
-        # e.g. "finance AI" + "manager/consultant"
         if role_family and domains:
             for domain in domains[:2]:
                 combo = f"{domain} {role_family}".strip()
@@ -65,87 +56,156 @@ def extract_search_terms(fingerprints: List[Dict]) -> List[str]:
     return terms[:4]
 
 
-# ── LinkedIn guest scraper ────────────────────────────────────────────────────
+# ── LinkedIn scraper ──────────────────────────────────────────────────────────
 
-def _search_linkedin(keywords: str, location: str, count: int = 25) -> List[Dict]:
-    """Fetch one page of LinkedIn job cards (guest API)."""
-    url = _LI_SEARCH.format(
-        keywords=requests.utils.quote(keywords),
-        location=requests.utils.quote(location),
-        count=count,
-        start=0,
+def _make_session() -> requests.Session:
+    """Create a session with cookies by visiting LinkedIn's public jobs page."""
+    session = requests.Session()
+    session.headers.update(_BASE_HEADERS)
+    try:
+        session.get(
+            "https://www.linkedin.com/jobs/search/?keywords=manager&location=United+States",
+            timeout=15,
+        )
+        time.sleep(1.5)
+    except Exception:
+        pass
+    return session
+
+
+def _extract_job_id_from_href(href: str) -> Optional[str]:
+    """Pull the numeric job ID from a LinkedIn /jobs/view/ URL."""
+    # Pattern: /jobs/view/some-title-at-company-1234567890
+    m = re.search(r"/jobs/view/[^?/]*?(\d{8,})", href)
+    if m:
+        return m.group(1)
+    # Fallback: just find any long number in the URL
+    m = re.search(r"(\d{9,})", href)
+    return m.group(1) if m else None
+
+
+def _search_linkedin(
+    session: requests.Session, keywords: str, location: str, count: int = 20
+) -> List[Dict]:
+    """Fetch job cards from LinkedIn's guest search API."""
+    url = (
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        f"?keywords={requests.utils.quote(keywords)}"
+        f"&location={requests.utils.quote(location)}"
+        f"&count={count}&start=0"
     )
     try:
-        r = requests.get(url, headers=_HEADERS, timeout=15)
+        r = session.get(url, timeout=15)
         r.raise_for_status()
-    except Exception:
+    except Exception as e:
         return []
 
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
 
     for card in soup.select("li"):
-        # Job ID
-        job_id = None
-        a_tag = card.select_one("a[data-tracking-id]") or card.select_one("a.base-card__full-link")
+        a_tag = (
+            card.select_one("a.base-card__full-link")
+            or card.select_one("a[href*='/jobs/view/']")
+        )
         if not a_tag:
-            a_tag = card.select_one("a[href*='/jobs/view/']")
-        if a_tag:
-            href = a_tag.get("href", "")
-            m = re.search(r"/jobs/view/(\d+)", href)
-            if m:
-                job_id = m.group(1)
+            continue
 
-        if not job_id:
-            # Try data attribute
-            entity = card.get("data-entity-urn", "")
-            m = re.search(r":(\d+)$", entity)
-            if m:
-                job_id = m.group(1)
-
+        href = a_tag.get("href", "")
+        job_id = _extract_job_id_from_href(href)
         if not job_id:
             continue
 
         title_el = card.select_one("h3.base-search-card__title") or card.select_one("h3")
         company_el = card.select_one("h4.base-search-card__subtitle") or card.select_one("h4")
-        location_el = card.select_one("span.job-search-card__location")
+        loc_el = card.select_one("span.job-search-card__location")
 
         jobs.append({
             "job_id": job_id,
             "title": title_el.get_text(strip=True) if title_el else "Unknown Role",
             "company": company_el.get_text(strip=True) if company_el else "Unknown Company",
-            "location": location_el.get_text(strip=True) if location_el else location,
+            "location": loc_el.get_text(strip=True) if loc_el else location,
             "url": f"https://www.linkedin.com/jobs/view/{job_id}",
         })
 
     return jobs
 
 
-def _fetch_description(job_id: str) -> Optional[str]:
-    """Fetch full job description from LinkedIn guest detail endpoint."""
-    url = _LI_DETAIL.format(job_id=job_id)
+def _fetch_description_linkedin(session: requests.Session, job_id: str) -> Optional[str]:
+    """Fetch a job's full description from LinkedIn's guest detail endpoint."""
+    url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
     try:
-        r = requests.get(url, headers=_HEADERS, timeout=15)
+        r = session.get(url, timeout=15)
         r.raise_for_status()
     except Exception:
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Primary selector
     desc_el = (
         soup.select_one("div.show-more-less-html__markup")
-        or soup.select_one("section.description")
         or soup.select_one("div.description__text")
-        or soup.select_one("div[class*='description']")
+        or soup.select_one("section.description")
     )
 
     if desc_el:
-        # Convert to clean plain text
         text = desc_el.get_text(separator="\n", strip=True)
         return text if len(text) > 80 else None
 
     return None
+
+
+# ── Indeed RSS fallback ───────────────────────────────────────────────────────
+
+def _search_indeed_rss(keywords: str, location: str, count: int = 20) -> List[Dict]:
+    """
+    Pull jobs from Indeed's RSS feed — very reliable, no cookies needed.
+    Descriptions are short summaries (not full JDs) but good enough to fingerprint.
+    """
+    try:
+        import feedparser
+    except ImportError:
+        return []
+
+    url = (
+        f"https://www.indeed.com/rss"
+        f"?q={requests.utils.quote(keywords)}"
+        f"&l={requests.utils.quote(location)}"
+        f"&limit={count}"
+    )
+    try:
+        feed = feedparser.parse(url)
+    except Exception:
+        return []
+
+    jobs = []
+    for entry in feed.entries[:count]:
+        raw_title = entry.get("title", "")
+        # Indeed titles are "Job Title - Company - Location"
+        parts = [p.strip() for p in raw_title.split(" - ")]
+        title = parts[0] if parts else raw_title
+        company = parts[1] if len(parts) > 1 else "Unknown Company"
+        loc = parts[2] if len(parts) > 2 else location
+
+        # Strip HTML from summary
+        summary_html = entry.get("summary", "")
+        summary = BeautifulSoup(summary_html, "html.parser").get_text(separator="\n", strip=True)
+
+        job_url = entry.get("link", "")
+
+        if not summary or len(summary) < 50:
+            continue
+
+        jobs.append({
+            "job_id": job_url,  # use URL as unique key
+            "title": title,
+            "company": company,
+            "location": loc,
+            "url": job_url,
+            "description": summary,
+        })
+
+    return jobs
 
 
 # ── Public interface ──────────────────────────────────────────────────────────
@@ -155,27 +215,32 @@ def scrape_similar_jobs(
     location: str = "United States",
     results_per_term: int = 15,
     delay: float = 1.5,
-    on_progress: Optional[Any] = None,
+    on_progress: Optional[Callable] = None,
 ) -> List[Dict]:
     """
-    Search LinkedIn for jobs similar to the given fingerprints.
-    Returns a list of job dicts with keys:
-      title, company, location, url, description, search_term
+    Search LinkedIn (+ Indeed fallback) for jobs matching the fingerprints.
+    Returns list of dicts: title, company, location, url, description, search_term, source.
     """
     search_terms = extract_search_terms(fingerprints)
     if not search_terms:
         return []
 
+    if on_progress:
+        on_progress(0, len(search_terms) + 1, "Initializing session…")
+
+    session = _make_session()
     all_jobs: list[Dict] = []
     seen_ids: set[str] = set()
+    total = len(search_terms)
 
-    total_steps = len(search_terms)
     for step, term in enumerate(search_terms):
         if on_progress:
-            on_progress(step, total_steps, f"Searching: {term}…")
+            on_progress(step, total, f"Searching LinkedIn: {term}…")
 
-        cards = _search_linkedin(term, location, count=results_per_term)
+        # ── LinkedIn ──
+        cards = _search_linkedin(session, term, location, count=results_per_term)
 
+        li_found = 0
         for card in cards:
             jid = card["job_id"]
             if jid in seen_ids:
@@ -183,7 +248,7 @@ def scrape_similar_jobs(
             seen_ids.add(jid)
 
             time.sleep(delay)
-            description = _fetch_description(jid)
+            description = _fetch_description_linkedin(session, jid)
             if not description:
                 continue
 
@@ -194,7 +259,25 @@ def scrape_similar_jobs(
                 "url": card["url"],
                 "description": description,
                 "search_term": term,
+                "source": "linkedin",
             })
+            li_found += 1
+
+        # ── Indeed fallback if LinkedIn gave nothing ──
+        if li_found == 0:
+            if on_progress:
+                on_progress(step, total, f"LinkedIn empty — trying Indeed: {term}…")
+            indeed_jobs = _search_indeed_rss(term, location, count=results_per_term)
+            for job in indeed_jobs:
+                jid = job["job_id"]
+                if jid in seen_ids:
+                    continue
+                seen_ids.add(jid)
+                job["search_term"] = term
+                job["source"] = "indeed"
+                all_jobs.append(job)
+
+        time.sleep(delay)
 
     return all_jobs
 
@@ -202,10 +285,7 @@ def scrape_similar_jobs(
 # ── Save to inbox ─────────────────────────────────────────────────────────────
 
 def save_jobs_to_inbox(jobs: List[Dict], inbox_dir: Path) -> List[Path]:
-    """
-    Write each job as a .md file with YAML frontmatter into inbox_dir.
-    Returns list of paths saved.
-    """
+    """Write each job as a .md file with YAML frontmatter into inbox_dir."""
     saved: list[Path] = []
     inbox_dir.mkdir(parents=True, exist_ok=True)
 
@@ -225,8 +305,8 @@ def save_jobs_to_inbox(jobs: List[Dict], inbox_dir: Path) -> List[Path]:
             f"company: {company}\n"
             f"role: {title}\n"
             f"location: {job.get('location', '')}\n"
-            f"source: linkedin ({job.get('url', '')})\n"
-            f"search_term: {job.get('search_term', '')}\n"
+            f"source: {job.get('source', 'scraped')} ({job.get('url', '')})\n"
+            f"search_term: \"{job.get('search_term', '')}\"\n"
             f"---\n\n"
         )
 
