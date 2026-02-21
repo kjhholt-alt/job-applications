@@ -27,6 +27,7 @@ _configure_user_workspace(current_user)
 from job_finder.alerts import build_alert_email, run_alerts, send_resend_email
 from job_finder.app_logic import (
     auto_import_applications_to_liked,
+    bulk_generate_applications,
     create_application_folder,
     ingest_folder,
     list_inbox_files,
@@ -146,7 +147,7 @@ client = ClaudeClient(api_key) if api_key else None
 profile = load_profile()
 
 
-tab_ingest, tab_matches, tab_liked, tab_profile = st.tabs(["Ingest", "Matches", "Liked", "Profile"])
+tab_ingest, tab_matches, tab_liked, tab_profile, tab_bulk = st.tabs(["Ingest", "Matches", "Liked", "Profile", "Bulk Generate"])
 
 with tab_ingest:
     st.subheader("Auto-Import Applied Jobs")
@@ -331,6 +332,118 @@ with tab_matches:
                         })
                         st.success("Fingerprint updated")
             st.divider()
+
+with tab_bulk:
+    st.subheader("Bulk Generate — Resumes & Cover Letters")
+    st.markdown(
+        "Pick a job you've already applied to as the **seed**. "
+        "We'll find the most similar inbox jobs and generate a tailored resume + cover letter for each one."
+    )
+
+    liked_jobs_all = list_jobs("liked")
+    liked_with_fp = [j for j in liked_jobs_all if j.fingerprint_json]
+
+    if not liked_with_fp:
+        st.warning(
+            "No liked jobs with fingerprints found. "
+            "Go to **Ingest** → copy your applied jobs → run **Ingest Liked** with fingerprinting enabled."
+        )
+    else:
+        seed_options = {
+            f"{j.company or 'Unknown'} — {j.role or j.job_id}": j
+            for j in liked_with_fp
+        }
+        selected_label = st.selectbox("Seed job (your applied / liked job)", list(seed_options.keys()))
+        seed_job = seed_options[selected_label]
+
+        inbox_jobs_all = list_jobs("inbox")
+        inbox_with_fp = [j for j in inbox_jobs_all if j.fingerprint_json]
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            top_n = st.number_input(
+                "How many similar jobs to generate docs for",
+                min_value=1, max_value=20, value=10, step=1,
+            )
+        with col_b:
+            st.metric("Inbox jobs available", len(inbox_with_fp))
+
+        if inbox_with_fp:
+            # Preview: show top matches before generating
+            if st.button("Preview Top Matches (no generation)"):
+                import json as _json
+                from job_finder.scoring import rank_by_seed as _rank
+
+                pairs = []
+                for j in inbox_with_fp:
+                    try:
+                        pairs.append((j, _json.loads(j.fingerprint_json)))
+                    except Exception:
+                        pass
+
+                seed_fp = _json.loads(seed_job.fingerprint_json)
+                ranked = _rank(pairs, seed_fp, top_n=int(top_n))
+
+                st.markdown(f"**Top {len(ranked)} matches for:** {selected_label}")
+                for rank_i, (score, job) in enumerate(ranked, 1):
+                    st.write(f"{rank_i}. **{job.company or 'Unknown'} — {job.role or job.job_id}** — score: `{score:.3f}`")
+
+        st.divider()
+
+        if st.button(f"Generate {int(top_n)} Resumes + Cover Letters", type="primary"):
+            if not client:
+                st.error("Claude key missing — add ANTHROPIC_API_KEY.")
+            else:
+                base_resume = load_base_resume()
+                if not base_resume:
+                    st.error("Missing base resume. Upload one in the Profile tab.")
+                elif not inbox_with_fp:
+                    st.warning("No inbox jobs with fingerprints. Ingest inbox first.")
+                else:
+                    status_text = st.empty()
+                    progress_bar = st.progress(0)
+
+                    generated_results = []
+                    total_jobs = min(int(top_n), len(inbox_with_fp))
+
+                    def _on_progress(i, total, job):
+                        label = f"{job.company or 'Unknown'} — {job.role or job.job_id}"
+                        status_text.text(f"Generating {i + 1}/{total}: {label}…")
+                        progress_bar.progress((i + 1) / total)
+
+                    try:
+                        generated_results = bulk_generate_applications(
+                            seed_job=seed_job,
+                            inbox_jobs=inbox_with_fp,
+                            base_resume=base_resume,
+                            client=client,
+                            top_n=int(top_n),
+                            on_progress=_on_progress,
+                        )
+                    except ValueError as e:
+                        st.error(str(e))
+
+                    progress_bar.progress(1.0)
+                    status_text.text("Done.")
+
+                    if generated_results:
+                        successes = [r for r in generated_results if r["error"] is None]
+                        failures = [r for r in generated_results if r["error"] is not None]
+
+                        st.success(f"Generated {len(successes)} application(s) successfully.")
+
+                        for r in successes:
+                            job = r["job"]
+                            label = f"{job.company or 'Unknown'} — {job.role or job.job_id}"
+                            st.markdown(
+                                f"✅ **{label}** — similarity `{r['score']:.3f}` — `{r['folder']}`"
+                            )
+
+                        for r in failures:
+                            job = r["job"]
+                            label = f"{job.company or 'Unknown'} — {job.role or job.job_id}"
+                            st.error(f"❌ {label} — {r['error']}")
+
 
 with tab_profile:
     st.subheader("Interest Profile")

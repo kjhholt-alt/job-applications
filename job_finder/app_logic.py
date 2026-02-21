@@ -4,7 +4,7 @@ import json
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .claude import ClaudeClient
 from .config import (
@@ -16,6 +16,7 @@ from .config import (
     get_user_base_resume_path,
 )
 from .parser import read_job_file, slugify
+from .scoring import rank_by_seed
 from .storage import JobRecord, list_jobs, upsert_job
 
 
@@ -131,6 +132,57 @@ def create_application_folder(job: JobRecord, resume_md: str, cover_letter_md: s
         cover_path.write_text(cover_letter_md, encoding="utf-8")
 
     return dest_dir
+
+
+def bulk_generate_applications(
+    seed_job: JobRecord,
+    inbox_jobs: List[JobRecord],
+    base_resume: str,
+    client: ClaudeClient,
+    top_n: int = 10,
+    on_progress: Optional[Callable[[int, int, JobRecord], None]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Score inbox_jobs against seed_job's fingerprint, take the top_n matches,
+    and generate a tailored resume + cover letter for each.
+
+    Calls on_progress(current_index, total, job) after each generation so the
+    caller can update a UI progress bar.
+
+    Returns a list of dicts:
+        {"job": JobRecord, "score": float, "folder": Path | None, "error": str | None}
+    """
+    if not seed_job.fingerprint_json:
+        raise ValueError("Seed job has no fingerprint. Run Fingerprint on it first.")
+
+    seed_fp = json.loads(seed_job.fingerprint_json)
+
+    # Build (job, fp_dict) pairs for all inbox jobs that have fingerprints
+    pairs = []
+    for job in inbox_jobs:
+        if not job.fingerprint_json:
+            continue
+        try:
+            fp = json.loads(job.fingerprint_json)
+        except json.JSONDecodeError:
+            continue
+        pairs.append((job, fp))
+
+    ranked = rank_by_seed(pairs, seed_fp, top_n=top_n)
+
+    results = []
+    total = len(ranked)
+    for i, (score, job) in enumerate(ranked):
+        if on_progress:
+            on_progress(i, total, job)
+        try:
+            resume_md, cover_md = client.generate_tailored_docs(base_resume, job.body or "")
+            dest = create_application_folder(job, resume_md, cover_md)
+            results.append({"job": job, "score": score, "folder": dest, "error": None})
+        except Exception as exc:
+            results.append({"job": job, "score": score, "folder": None, "error": str(exc)})
+
+    return results
 
 
 def load_base_resume() -> str:

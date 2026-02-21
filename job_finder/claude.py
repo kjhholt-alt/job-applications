@@ -66,7 +66,7 @@ class ClaudeClient:
             f"BASE RESUME (SOURCE OF TRUTH):\n{base_resume}\n\n"
             f"JOB DESCRIPTION:\n{job_text}\n"
         )
-        result = self._request(system, user, max_tokens=1800)
+        result = self._request(system, user, max_tokens=4000)
         data = _parse_json(result["text"])
         resume_md = data.get("resume_md", "")
         cover_letter_md = data.get("cover_letter_md", "")

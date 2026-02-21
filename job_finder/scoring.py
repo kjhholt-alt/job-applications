@@ -80,6 +80,21 @@ def aggregate_profile(fingerprints: List[Dict]) -> Dict:
     return agg
 
 
+def score_against_seed(job_fp: Dict, seed_fp: Dict) -> float:
+    """Score a single job fingerprint directly against a seed fingerprint."""
+    return similarity(job_fp, seed_fp)
+
+
+def rank_by_seed(jobs_with_fps: List[tuple], seed_fp: Dict, top_n: int = 10) -> List[tuple]:
+    """
+    Rank (job, fingerprint_dict) pairs by similarity to seed_fp.
+    Returns top_n as [(score, job), ...] sorted descending.
+    """
+    scored = [(similarity(fp, seed_fp), job) for job, fp in jobs_with_fps]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_n]
+
+
 def score_against_liked(job_fp: Dict, liked_fps: List[Dict], profile: InterestProfile | None = None) -> float:
     if not liked_fps:
         return 0.0
