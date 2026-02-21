@@ -50,9 +50,11 @@ from job_finder.env import ensure_anthropic_key, ensure_resend_key, get_resend_f
 from job_finder.filtering import evaluate_filters, load_reputable_companies, save_reputable_companies
 from job_finder.profile import InterestProfile, load_profile, save_profile
 from job_finder.scoring import score_against_liked
+from job_finder.scraper import extract_search_terms, scrape_similar_jobs, save_jobs_to_inbox
 from job_finder.storage import list_jobs, upsert_job
 
-st.title("Job Similarity Finder")
+st.title("Job Application Assistant")
+st.caption("Generate tailored resumes and cover letters for jobs similar to ones you've already applied to.")
 
 for folder in [
     get_data_dir(),
@@ -63,17 +65,78 @@ for folder in [
 ]:
     folder.mkdir(parents=True, exist_ok=True)
 
-with st.expander("Quick Start", expanded=True):
+# ── Setup checklist ────────────────────────────────────────────────────────
+base_resume_exists = load_base_resume() != ""
+liked_jobs_count = len(list_jobs("liked"))
+inbox_jobs_count = len(list_jobs("inbox"))
+liked_with_fp = sum(1 for j in list_jobs("liked") if j.fingerprint_json)
+inbox_with_fp = sum(1 for j in list_jobs("inbox") if j.fingerprint_json)
+
+all_ready = base_resume_exists and liked_with_fp > 0 and inbox_with_fp > 0
+
+with st.expander("How this works — setup checklist" if not all_ready else "✅ Setup complete — ready to generate", expanded=not all_ready):
+    st.markdown("### How it works")
     st.markdown(
-        """
-1. Go to **Ingest** -> click **Copy applications/ job descriptions into liked bucket**.
-2. Click **Ingest Liked** (this builds your taste profile).
-3. Add new job descriptions to `job-applications/jobs/inbox/`.
-4. Click **Ingest Inbox**.
-5. Go to **Matches** to review and move good fits to liked.
-6. Optional: **Generate Resume+CL** to create tailored docs.
-        """
+        "This tool learns what jobs you like based on roles you've already applied to, "
+        "then finds similar jobs from your inbox and generates a **tailored resume + cover letter for each one** automatically."
     )
+
+    st.markdown("### Setup checklist")
+
+    # Step 1
+    if base_resume_exists:
+        st.success("**Step 1 — Base resume:** Loaded ✓")
+    else:
+        st.error("**Step 1 — Base resume: Missing ✗**")
+        st.markdown(
+            "Go to the **Profile** tab → upload your resume as a `.md` or `.txt` file. "
+            "This is the source of truth — Claude will tailor it to each job without inventing anything."
+        )
+
+    # Step 2
+    if liked_with_fp > 0:
+        st.success(f"**Step 2 — Applied jobs ingested:** {liked_with_fp} job(s) with fingerprints ✓")
+    elif liked_jobs_count > 0:
+        st.warning(f"**Step 2 — Applied jobs:** {liked_jobs_count} imported but not yet fingerprinted")
+        st.markdown("Go to **Ingest** tab → click **Ingest Liked** (make sure 'Run Claude fingerprint extraction' is checked).")
+    else:
+        st.error("**Step 2 — Applied jobs: None imported ✗**")
+        st.markdown(
+            "Go to the **Ingest** tab → click **'Copy applications/ job descriptions into liked bucket'** "
+            "→ then click **Ingest Liked**. "
+            "This tells the system what kinds of roles you're targeting."
+        )
+
+    # Step 3
+    if inbox_with_fp > 0:
+        st.success(f"**Step 3 — New jobs to apply to:** {inbox_with_fp} job(s) ready ✓")
+    elif inbox_jobs_count > 0:
+        st.warning(f"**Step 3 — Inbox jobs:** {inbox_jobs_count} loaded but not fingerprinted")
+        st.markdown("Go to **Ingest** tab → click **Ingest Inbox**.")
+    else:
+        st.error("**Step 3 — Inbox jobs: Empty ✗**")
+        st.markdown("---")
+        st.markdown("#### How to add jobs to your inbox")
+        st.markdown(
+            "These are jobs you **want to apply to** — the system will find the ones most similar "
+            "to your Deloitte applications and generate a tailored resume + cover letter for each."
+        )
+        st.markdown("**Here's how to add them:**")
+        st.markdown(
+            "1. Find a job posting on LinkedIn, Indeed, or a company careers page\n"
+            "2. Copy the full job description text\n"
+            "3. Paste it into a new file — name it something like `company-role.md` (e.g. `pwc-ai-manager.md`)\n"
+            f"4. Save that file into this folder on your computer:\n\n   `{get_inbox_dir()}`\n\n"
+            "5. Repeat for as many jobs as you want (aim for 10–20)\n"
+            "6. Come back here and go to **Ingest** tab → click **Ingest Inbox**"
+        )
+        st.info("💡 No special formatting needed — just paste the raw job description text and save as .md")
+
+    # Step 4
+    if all_ready:
+        st.success("**Step 4 — Generate:** Go to the **Bulk Generate** tab, pick a seed job, and hit generate.")
+    else:
+        st.info("**Step 4 — Generate:** Once steps 1–3 are done, go to **Bulk Generate** to create your documents.")
 
 api_key, key_source = ensure_anthropic_key()
 resend_key, resend_source = ensure_resend_key()
@@ -150,18 +213,99 @@ profile = load_profile()
 tab_ingest, tab_matches, tab_liked, tab_profile, tab_bulk = st.tabs(["Ingest", "Matches", "Liked", "Profile", "Bulk Generate"])
 
 with tab_ingest:
-    st.subheader("Auto-Import Applied Jobs")
+    st.info(
+        "**This tab feeds the system.** "
+        "First import your already-applied jobs (Liked), then add new jobs you want docs for (Inbox). "
+        "Fingerprinting uses Claude to extract skills/keywords from each job — required before scoring or generating."
+    )
+    st.subheader("Step 1 — Import your applied jobs (Liked)")
+    st.caption("Pulls job-description.md from each folder in applications/ into the liked bucket.")
     if st.button("Copy applications/ job descriptions into liked bucket"):
         count = auto_import_applications_to_liked()
         st.success(f"Copied {count} file(s) to jobs/liked/")
 
-    st.subheader("Inbox Jobs")
+    st.divider()
+    st.subheader("Step 2 — Run fingerprinting on Liked jobs")
+    st.caption("Extracts skills, domains, and keywords from each liked job. This is what similarity scoring is based on.")
+
+    st.subheader("Liked Jobs")
     inbox_files = list_inbox_files()
     if not inbox_files:
         st.info("Drop job-description markdown files into jobs/inbox/")
     else:
         for path in inbox_files:
             st.write(path.name)
+
+    st.divider()
+    st.subheader("Step 3 — Find Similar Jobs Automatically")
+
+    liked_for_scrape = list_jobs("liked")
+    liked_fps_for_scrape = []
+    for j in liked_for_scrape:
+        if j.fingerprint_json:
+            try:
+                liked_fps_for_scrape.append(json.loads(j.fingerprint_json))
+            except Exception:
+                pass
+
+    if liked_fps_for_scrape:
+        terms_preview = extract_search_terms(liked_fps_for_scrape)
+        st.markdown(
+            "Based on your applied jobs, we'll search LinkedIn for similar roles and drop them "
+            "straight into your inbox — ready to fingerprint and generate documents for."
+        )
+        st.caption(f"Search terms derived from your profile: **{' | '.join(terms_preview)}**")
+
+        col_loc, col_n = st.columns(2)
+        with col_loc:
+            scrape_location = st.text_input("Location", value="United States")
+        with col_n:
+            scrape_n = st.number_input("Results per search term", min_value=5, max_value=30, value=15, step=5)
+
+        if st.button("🔍 Find Similar Jobs on LinkedIn", type="primary"):
+            scrape_status = st.empty()
+            scrape_progress = st.progress(0)
+
+            scraped_jobs = []
+            scrape_errors = []
+
+            def _scrape_progress(step, total, msg):
+                scrape_status.text(msg)
+                scrape_progress.progress((step + 1) / max(total, 1))
+
+            try:
+                scraped_jobs = scrape_similar_jobs(
+                    fingerprints=liked_fps_for_scrape,
+                    location=scrape_location,
+                    results_per_term=int(scrape_n),
+                    on_progress=_scrape_progress,
+                )
+            except Exception as e:
+                scrape_errors.append(str(e))
+
+            scrape_progress.progress(1.0)
+
+            if scrape_errors:
+                scrape_status.text("Finished with errors.")
+                for err in scrape_errors:
+                    st.error(err)
+            elif not scraped_jobs:
+                scrape_status.text("No jobs found — LinkedIn may be rate limiting. Try again in a minute.")
+            else:
+                saved_paths = save_jobs_to_inbox(scraped_jobs, get_inbox_dir())
+                scrape_status.text(f"Saved {len(saved_paths)} job(s) to inbox.")
+                st.success(f"Found **{len(scraped_jobs)} jobs** across {len(terms_preview)} searches → saved to inbox. Now click **Ingest Inbox** below.")
+                for j in scraped_jobs:
+                    st.write(f"• **{j['company']}** — {j['title']} ({j['location']})")
+    else:
+        st.info("Complete Step 2 first — ingest your applied jobs so we know what to search for.")
+
+    st.divider()
+    st.subheader("Step 3b — Or add jobs manually")
+    st.markdown(
+        f"Drop job description `.md` files into:\n\n`{get_inbox_dir()}`\n\n"
+        "Then ingest them below."
+    )
 
     run_fingerprint = st.checkbox("Run Claude fingerprint extraction", value=True)
     if st.button("Ingest Inbox"):
@@ -171,6 +315,7 @@ with tab_ingest:
             ingested = ingest_folder(INBOX_DIR, "inbox", client if run_fingerprint else None)
             st.success(f"Ingested {len(ingested)} job(s)")
 
+    st.divider()
     st.subheader("Liked Jobs")
     liked_files = list_liked_files()
     if not liked_files:
@@ -446,9 +591,13 @@ with tab_bulk:
 
 
 with tab_profile:
-    st.subheader("Interest Profile")
+    st.info(
+        "**Start here.** Upload your base resume before doing anything else. "
+        "Claude uses it as the source of truth when tailoring documents — it will never invent jobs, dates, or credentials."
+    )
 
     st.subheader("Base Resume")
+    st.caption("Upload your resume as a markdown (.md) or plain text (.txt) file. Paste it into a .md file if needed.")
     user_resume_path = get_user_base_resume_path()
     if user_resume_path.exists():
         st.caption(f"Loaded: {user_resume_path}")
